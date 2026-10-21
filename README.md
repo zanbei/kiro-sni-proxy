@@ -878,7 +878,39 @@ aws ec2 describe-instance-types --region us-east-1 --instance-types <INSTANCE_TY
   --query 'InstanceTypes[0].NetworkInfo.[MaximumNetworkInterfaces,Ipv4AddressesPerInterface]'
 ```
 
-> 📌 本节为方案推导与操作整理，**尚未做端到端实测**（§8.4 的多网卡结论已实测）。其中「辅助 IP 需在实例内 `ip addr add`」是 Ubuntu 上最容易漏的一步，实施时请以 Step 5 的验证结果为准。
+#### 实测结果
+
+环境：us-west-2，`t4g.small`，Ubuntu 24.04，**单块 ENI**，1 个主私有 IP + 1 个辅助私有 IP，各绑 1 个 EIP，`ENABLE_PRIVATELINK=false`（转发目标为 us-east-1 的 Kiro 域名）。
+
+**对照实验：验证「辅助 IP 必须在实例内添加」**
+
+两个 EIP 的安全组、nginx 配置完全相同，唯一差别是操作系统里有没有那个辅助地址：
+
+| 阶段 | `ip -br addr show dev ens5` | EIP-A（主 IP） | EIP-B（辅助 IP） |
+|---|---|---|---|
+| `ip addr add` 之前 | 只有 `172.31.32.140/20` | `http=404` 正常 | **`http=000`，`connect=0.000000`，超时** |
+| `ip addr add` 之后 | 两个地址都在 | `http=404` 正常 | **`http=404` 正常** |
+
+EIP-B 失败时 TCP 连接**根本没有建立**（`connect` 耗时为 0），因为内核没有这个本地地址，包在进 nginx 之前就被丢掉了 —— 所以查安全组和 nginx 都看不出问题。这一步不能省。
+
+**转发与白名单**
+
+服务端 `sni.log` 按 `to=` 可区分入口，两个入口都正常工作：
+
+| 入口私有 IP | 对应 EIP | `q.us-east-1.amazonaws.com` | `example.com` |
+|---|---|---|---|
+| `172.31.32.140`（主） | EIP-A | `status=200`（后端返回 404） | 白名单拒绝，`backend=""` |
+| `172.31.38.27`（辅助） | EIP-B | `status=200`（后端返回 404） | 白名单拒绝，`backend=""` |
+
+**持久化与「不需要策略路由」**
+
+写入 `/etc/netplan/60-secondary-ips.yaml` 后 `netplan generate` 校验通过，**重启实例**复测：
+
+- 辅助 IP 自动恢复（`ens5` 同时持有 `172.31.32.140/20` 和 `172.31.38.27/20`）
+- `ip rule` 只有系统默认三条（`local` / `main` / `default`），**无任何自定义策略路由**
+- 两个 EIP 各测 3 次，均 3/3 返回 404
+
+这从实机上确认了本节与 §8.4 的核心差异：单网卡多 IP 进出同一块网卡，不存在非对称路由问题，**完全不需要 `ip rule` 和独立路由表**。
 
 ## 9. 方案局限
 

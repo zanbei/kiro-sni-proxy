@@ -339,7 +339,12 @@ log "实例已创建: ${INSTANCE_ID}，等待 running..."
 #############################################
 log "查询实例网卡（共 ${ENI_COUNT} 块）"
 # 按 DeviceIndex 排序，得到 "eni-id private-ip" 列表（主网卡在前）
-mapfile -t ENI_ROWS < <("${AWSCLI[@]}" ec2 describe-instances --instance-ids "${INSTANCE_ID}" \
+# 注：不用 mapfile —— 它是 bash 4.0+ 内建，macOS 自带 bash 3.2 没有，
+#     会以 "mapfile: command not found" 中断部署。改用 while read 兼容 3.2。
+ENI_ROWS=()
+while IFS= read -r _row; do
+  [[ -n "${_row}" ]] && ENI_ROWS+=("${_row}")
+done < <("${AWSCLI[@]}" ec2 describe-instances --instance-ids "${INSTANCE_ID}" \
     --query 'sort_by(Reservations[0].Instances[0].NetworkInterfaces,&Attachment.DeviceIndex)[].[NetworkInterfaceId,PrivateIpAddress]' \
     --output text | tr '\t' ' ')
 [[ "${#ENI_ROWS[@]}" -eq "${ENI_COUNT}" ]] \
