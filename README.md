@@ -445,6 +445,8 @@ aws ec2 delete-vpc-endpoints --region us-east-1 \
 
 单台代理可以挂多块 ENI，同时从多个入口接收转发流量。
 
+> 💡 **如果你的需求只是「多个入口公网 IP」，不需要多网卡** —— 单块 ENI 加多个辅助私有 IP、各绑一个 EIP 就够了，IP 上限更高（c6g.large 为 10 个 vs 3 块网卡），而且完全不用配策略路由。见 **§8.5**。多网卡真正解决的是「每个入口需要独立安全组 / 不同子网 / 可整块迁移到其它实例」这类需求。
+
 - **入站**：nginx 配置 `listen 443 reuseport;` 未指定 IP，等价于监听 `0.0.0.0:443`，所有网卡上的所有 IP 同时生效。客户端 hosts 指向哪个 EIP / 私有 IP，流量就从对应网卡进入。
 - **自动化**：`deploy/config.env` 设置 `ENI_COUNT=2`（或更大）即可，脚本会在 `run-instances` 时内联声明多块 ENI，并为每块 ENI 各绑一个 EIP，`client-hosts.txt` 按网卡分组输出。
 - **日志**：`log_format` 增加了 `to=$server_addr`，可以直接看出每条连接从哪块网卡进入。
@@ -729,6 +731,186 @@ curl -sk -m 15 -o /dev/null -w '%{http_code}\n' \
 | 绑定 EIP 到 ENI | 弹性 IP → 操作 → 关联（资源类型选**网络接口**） | `associate-address --network-interface-id` |
 | 登录实例 | Systems Manager → 会话管理器 | `ssm start-session` |
 | 批量下发命令 | Systems Manager → Run Command | `ssm send-command` |
+
+### 8.5 单网卡多公网 IP（辅助私有 IP + 多 EIP）
+
+**只要多个入口公网 IP 的首选方案。** 一块 ENI 可以持有多个私有 IPv4（1 个主 + N 个辅助），每个私有 IP 都能各自关联一个 EIP。客户端 hosts 指向哪个 EIP，流量就从对应 IP 进入，nginx 侧零改动。
+
+相比 §8.4 的多网卡，这个方案少了最麻烦的一环：**不需要策略路由**。多网卡的 `ip rule` 是为了解决「请求进 eth1、回包却走 eth0 导致源地址不匹配被丢」的非对称路由问题；单网卡场景下进出都是同一块网卡、同一条默认路由，问题根本不存在。
+
+#### 两种方案怎么选
+
+| 维度 | §8.4 多网卡 | §8.5 单网卡多 IP |
+|---|---|---|
+| 入口 IP 上限（c6g.large） | 3（每块网卡 1 个主 IP） | **10**（1 主 + 9 辅助） |
+| 策略路由 | **必需**，热挂载还要手工配 | **不需要** |
+| 实例内配置 | `ip rule` + 独立路由表 + netplan | 仅 `ip addr add` + netplan |
+| 每个入口独立安全组 | ✅ 可以 | ❌ 共用 ENI 的安全组 |
+| 跨子网 / 跨 AZ | ✅ 可以 | ❌ 必须同一子网 |
+| 入口整体迁到其它实例 | ✅ 卸载 ENI 再挂载即可 | ❌ 不支持 |
+| 提升带宽 | ❌ 不提升 | ❌ 不提升 |
+
+带宽取决于实例规格，两种方案都不会让它变大。真要吞吐或高可用，走 §8.2 的 ASG + NLB。
+
+**选 §8.5**：只是想要几个备用入口 IP（比如某个 EIP 在国内被污染后随时切换）。
+**选 §8.4**：每个入口要不同安全组、要落在不同子网/AZ、或希望某个入口能带着 IP 整体漂移到备用实例。
+
+> 每个 EIP 均按 ~\$3.65/月 计费，与方案无关。另注意 **EIP 默认配额为每区域 5 个**（可提工单调整），规划较多入口时先确认配额。
+
+#### ⚠️ 唯一的坑：辅助 IP 必须在实例内手工添加
+
+AWS 侧分配了辅助私有 IP，**不等于**操作系统知道它。Ubuntu 的 DHCP 只会拿到 ENI 的**主** IP，辅助 IP 不在 DHCP 应答里。内核没有这个本地地址，发往它的包会被直接丢弃 —— 表现就是 EIP 能 ping 不通、curl 超时，而安全组、nginx 看起来都没问题。
+
+`listen 443` 等价于 `0.0.0.0:443`，含义是「所有**本地**地址」；地址不是本地的，包压根到不了 nginx。所以 `ip addr add` 这一步不能省。
+
+#### 控制台操作流程
+
+**Step 1：给 ENI 增加辅助私有 IP**
+
+EC2 控制台 → **实例** → 勾选实例 → **操作** → **网络** → **管理 IP 地址**（也可从 **网络接口** 列表选中 ENI 后走 **操作** → **管理 IP 地址**）：
+
+1. 展开目标 ENI（主网卡）
+2. **IPv4 地址** 下点 **分配新 IP 地址**
+3. 留空表示由子网自动分配，也可指定子网内未被占用的地址
+4. 需要几个就点几次 → **保存**
+
+记下新分配的辅助私有 IP。
+
+**Step 2：分配 EIP 并绑到辅助私有 IP**
+
+1. EC2 → **网络和安全** → **弹性 IP** → **分配弹性 IP 地址** → **分配**
+2. 勾选新 EIP → **操作** → **关联弹性 IP 地址**
+3. 关键填法：
+   - **资源类型** → **网络接口**
+   - **网络接口** → 实例的主网卡
+   - **私有 IP 地址** → ⚠️ 选 **Step 1 新增的那个辅助 IP**（默认会选主 IP，选错就绑到原来的入口上了，等于没加新入口）
+4. **关联**
+
+**Step 3：在实例内添加该地址**
+
+Systems Manager → **会话管理器** → **启动会话** → 选中实例。
+
+```bash
+# 查看网卡名与当前地址（EC2 Nitro/Graviton 上主网卡通常是 ens5）
+ip -br addr
+
+# 添加辅助 IP，掩码用子网的掩码长度（如 10.199.1.0/24 则为 /24）
+sudo ip addr add <辅助私有IP>/<掩码长度> dev ens5
+
+ip -br addr    # 确认该地址已出现
+```
+
+上面是临时生效，重启会丢。持久化新建 `/etc/netplan/60-secondary-ips.yaml`：
+
+```yaml
+network:
+  version: 2
+  ethernets:
+    ens5:
+      dhcp4: true
+      addresses:
+        - <辅助私有IP>/<掩码长度>
+        # 多个辅助 IP 就多写几行
+```
+
+```bash
+sudo chmod 600 /etc/netplan/60-secondary-ips.yaml
+sudo netplan try      # 确认网络未中断后回车确认
+```
+
+`dhcp4: true` 继续负责主 IP，`addresses` 只是额外追加，两者不冲突。netplan 会把同一网卡在多个文件里的配置合并。
+
+**Step 4：nginx 不用改**
+
+`listen 443` 已覆盖本机所有地址。想在日志里区分入口，用和 §8.4 相同的办法给 `log_format` 加 `to=$server_addr`，日志里即可看出连接打在哪个 IP 上。
+
+**Step 5：验证**
+
+逐个入口测，`--resolve` 不依赖 hosts：
+
+```bash
+curl -sk -m 15 -o /dev/null -w '%{http_code}\n' \
+  --resolve q.us-east-1.amazonaws.com:443:<新EIP> https://q.us-east-1.amazonaws.com/
+# 期望 404（后端对根路径的正常响应，说明透传成功）
+```
+
+返回 `000` 的排查顺序：
+
+1. `ip -br addr` 里有没有这个辅助 IP（最常见原因，即 Step 3 漏了）
+2. EIP 是否绑在**辅助** IP 上而不是主 IP（控制台 弹性 IP 列表的「私有 IP 地址」列）
+3. 安全组是否放行你的实际出口 IP
+4. `sudo ss -ltnp | grep 443` 确认 nginx 在监听
+
+**Step 6：回收**
+
+1. **弹性 IP** → 勾选 → **操作** → **取消关联** → 再 **操作** → **释放**
+2. **实例** → **操作** → **网络** → **管理 IP 地址** → 辅助 IP 右侧 **取消分配** → **保存**
+3. 删掉 `/etc/netplan/60-secondary-ips.yaml` 里对应行并 `sudo netplan apply`
+
+#### CLI 等价操作
+
+```bash
+# 1) 给 ENI 加 1 个辅助私有 IP（也可用 --private-ip-addresses 指定具体地址）
+aws ec2 assign-private-ip-addresses --region us-east-1 \
+  --network-interface-id <ENI_ID> --secondary-private-ip-address-count 1
+
+# 2) 分配 EIP
+aws ec2 allocate-address --region us-east-1 --domain vpc \
+  --query AllocationId --output text
+
+# 3) 绑到指定的辅助私有 IP（--private-ip-address 是关键）
+aws ec2 associate-address --region us-east-1 \
+  --allocation-id <EIP_ALLOC_ID> \
+  --network-interface-id <ENI_ID> \
+  --private-ip-address <辅助私有IP>
+
+# 回收
+aws ec2 disassociate-address --region us-east-1 --association-id <EIP_ASSOC_ID>
+aws ec2 release-address --region us-east-1 --allocation-id <EIP_ALLOC_ID>
+aws ec2 unassign-private-ip-addresses --region us-east-1 \
+  --network-interface-id <ENI_ID> --private-ip-addresses <辅助私有IP>
+```
+
+查本实例类型的每网卡 IP 上限：
+
+```bash
+aws ec2 describe-instance-types --region us-east-1 --instance-types <INSTANCE_TYPE> \
+  --query 'InstanceTypes[0].NetworkInfo.[MaximumNetworkInterfaces,Ipv4AddressesPerInterface]'
+```
+
+#### 实测结果
+
+环境：us-west-2，`t4g.small`，Ubuntu 24.04，**单块 ENI**，1 个主私有 IP + 1 个辅助私有 IP，各绑 1 个 EIP，`ENABLE_PRIVATELINK=false`（转发目标为 us-east-1 的 Kiro 域名）。
+
+**对照实验：验证「辅助 IP 必须在实例内添加」**
+
+两个 EIP 的安全组、nginx 配置完全相同，唯一差别是操作系统里有没有那个辅助地址：
+
+| 阶段 | `ip -br addr show dev ens5` | EIP-A（主 IP） | EIP-B（辅助 IP） |
+|---|---|---|---|
+| `ip addr add` 之前 | 只有 `172.31.32.140/20` | `http=404` 正常 | **`http=000`，`connect=0.000000`，超时** |
+| `ip addr add` 之后 | 两个地址都在 | `http=404` 正常 | **`http=404` 正常** |
+
+EIP-B 失败时 TCP 连接**根本没有建立**（`connect` 耗时为 0），因为内核没有这个本地地址，包在进 nginx 之前就被丢掉了 —— 所以查安全组和 nginx 都看不出问题。这一步不能省。
+
+**转发与白名单**
+
+服务端 `sni.log` 按 `to=` 可区分入口，两个入口都正常工作：
+
+| 入口私有 IP | 对应 EIP | `q.us-east-1.amazonaws.com` | `example.com` |
+|---|---|---|---|
+| `172.31.32.140`（主） | EIP-A | `status=200`（后端返回 404） | 白名单拒绝，`backend=""` |
+| `172.31.38.27`（辅助） | EIP-B | `status=200`（后端返回 404） | 白名单拒绝，`backend=""` |
+
+**持久化与「不需要策略路由」**
+
+写入 `/etc/netplan/60-secondary-ips.yaml` 后 `netplan generate` 校验通过，**重启实例**复测：
+
+- 辅助 IP 自动恢复（`ens5` 同时持有 `172.31.32.140/20` 和 `172.31.38.27/20`）
+- `ip rule` 只有系统默认三条（`local` / `main` / `default`），**无任何自定义策略路由**
+- 两个 EIP 各测 3 次，均 3/3 返回 404
+
+这从实机上确认了本节与 §8.4 的核心差异：单网卡多 IP 进出同一块网卡，不存在非对称路由问题，**完全不需要 `ip rule` 和独立路由表**。
 
 ## 9. 方案局限
 
